@@ -47,6 +47,7 @@ use {
     solana_tls_utils::NotifyKeyUpdate,
     solana_validator_exit::Exit,
     std::{
+        io::SeekFrom,
         net::{SocketAddr, UdpSocket},
         path::{Path, PathBuf},
         pin::Pin,
@@ -58,7 +59,10 @@ use {
         thread::{self, Builder, JoinHandle},
         time::{Duration, Instant},
     },
-    tokio::runtime::{Builder as TokioBuilder, Handle as RuntimeHandle, Runtime as TokioRuntime},
+    tokio::{
+        io::{AsyncReadExt, AsyncSeekExt},
+        runtime::{Builder as TokioBuilder, Handle as RuntimeHandle, Runtime as TokioRuntime},
+    },
     tokio_util::{
         bytes::Bytes,
         codec::{BytesCodec, FramedRead},
@@ -132,6 +136,22 @@ struct RpcRequestMiddleware {
     health: Arc<RpcHealth>,
 }
 
+/// Parsed inclusive byte range for HTTP Range requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ByteRange {
+    start: u64,
+    end: u64,
+}
+
+/// Error type for range parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeError {
+    /// Malformed or multi-range — fall back to 200.
+    Invalid,
+    /// Range not satisfiable — return 416.
+    NotSatisfiable,
+}
+
 impl RpcRequestMiddleware {
     pub fn new(
         ledger_path: PathBuf,
@@ -179,6 +199,66 @@ impl RpcRequestMiddleware {
 
     fn strip_leading_slash(path: &str) -> Option<&str> {
         path.strip_prefix('/')
+    }
+
+    /// Parse an HTTP Range header value per RFC 7233.
+    ///
+    /// Supports `bytes=start-end`, `bytes=start-`, and `bytes=-suffix`.
+    /// Multi-range (comma-separated) is rejected as `Invalid`.
+    fn parse_range_header(
+        header: &hyper::header::HeaderValue,
+        file_length: u64,
+    ) -> Result<ByteRange, RangeError> {
+        let value = header.to_str().map_err(|_| RangeError::Invalid)?;
+        let spec = value.strip_prefix("bytes=").ok_or(RangeError::Invalid)?;
+
+        // Reject multi-range
+        if spec.contains(',') {
+            return Err(RangeError::Invalid);
+        }
+
+        let (start_str, end_str) = spec.split_once('-').ok_or(RangeError::Invalid)?;
+
+        if start_str.is_empty() {
+            // Suffix range: bytes=-500 means last 500 bytes
+            let suffix_len: u64 = end_str.parse().map_err(|_| RangeError::Invalid)?;
+            if suffix_len == 0 {
+                return Err(RangeError::NotSatisfiable);
+            }
+            let start = file_length.saturating_sub(suffix_len);
+            Ok(ByteRange {
+                start,
+                end: file_length - 1,
+            })
+        } else {
+            let start: u64 = start_str.parse().map_err(|_| RangeError::Invalid)?;
+            if start >= file_length {
+                return Err(RangeError::NotSatisfiable);
+            }
+            let end = if end_str.is_empty() {
+                // Open-ended: bytes=500-
+                file_length - 1
+            } else {
+                let end: u64 = end_str.parse().map_err(|_| RangeError::Invalid)?;
+                // Clamp to file size per RFC 7233
+                end.min(file_length - 1)
+            };
+            if end < start {
+                return Err(RangeError::NotSatisfiable);
+            }
+            Ok(ByteRange { start, end })
+        }
+    }
+
+    fn range_not_satisfiable(file_length: u64) -> hyper::Response<hyper::Body> {
+        hyper::Response::builder()
+            .status(hyper::StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(
+                hyper::header::CONTENT_RANGE,
+                format!("bytes */{file_length}"),
+            )
+            .body(hyper::Body::empty())
+            .unwrap()
     }
 
     fn is_file_get_path(&self, path: &str) -> bool {
@@ -252,7 +332,11 @@ impl RpcRequestMiddleware {
         )
     }
 
-    fn process_file_get(&self, path: &str) -> RequestMiddlewareAction {
+    fn process_file_get(
+        &self,
+        path: &str,
+        range_header: Option<hyper::header::HeaderValue>,
+    ) -> RequestMiddlewareAction {
         let (filename, snapshot_type) = {
             let stem = Self::strip_leading_slash(path).expect("path already verified");
             match path {
@@ -269,9 +353,29 @@ impl RpcRequestMiddleware {
         };
         let file_length = std::fs::metadata(&filename)
             .map(|m| m.len())
-            .unwrap_or(0)
-            .to_string();
+            .unwrap_or(0);
         info!("get {path} -> {filename:?} ({file_length} bytes)");
+
+        // Parse range header if present
+        let range = range_header.as_ref().and_then(|hv| {
+            match Self::parse_range_header(hv, file_length) {
+                Ok(r) => Some(Ok(r)),
+                Err(RangeError::NotSatisfiable) => Some(Err(())),
+                Err(RangeError::Invalid) => None, // fall back to full response
+            }
+        });
+
+        // 416 Range Not Satisfiable — return early before opening file
+        if matches!(range, Some(Err(()))) {
+            return RequestMiddlewareAction::Respond {
+                should_validate_hosts: true,
+                response: Box::pin(async move {
+                    Ok(Self::range_not_satisfiable(file_length))
+                }),
+            };
+        }
+
+        let byte_range = range.and_then(|r| r.ok());
 
         if cfg!(not(test)) {
             assert!(
@@ -310,18 +414,49 @@ impl RpcRequestMiddleware {
                     } else {
                         Self::internal_server_error()
                     }),
-                    Ok(file) => {
-                        let stream =
-                            FramedRead::new(file, BytesCodec::new()).map_ok(|b| b.freeze());
-                        let body = if let Some(timeout) = snapshot_timeout {
-                            hyper::Body::wrap_stream(TimeoutStream::new(stream, timeout))
+                    Ok(mut file) => {
+                        if let Some(range) = byte_range {
+                            let content_length = range.end - range.start + 1;
+                            if let Err(_err) =
+                                file.seek(SeekFrom::Start(range.start)).await
+                            {
+                                return Ok(Self::internal_server_error());
+                            }
+                            let limited = file.take(content_length);
+                            let stream = FramedRead::new(limited, BytesCodec::new())
+                                .map_ok(|b| b.freeze());
+                            let body = if let Some(timeout) = snapshot_timeout {
+                                hyper::Body::wrap_stream(TimeoutStream::new(stream, timeout))
+                            } else {
+                                hyper::Body::wrap_stream(stream)
+                            };
+                            Ok(hyper::Response::builder()
+                                .status(hyper::StatusCode::PARTIAL_CONTENT)
+                                .header(hyper::header::CONTENT_LENGTH, content_length)
+                                .header(
+                                    hyper::header::CONTENT_RANGE,
+                                    format!(
+                                        "bytes {}-{}/{}",
+                                        range.start, range.end, file_length
+                                    ),
+                                )
+                                .header(hyper::header::ACCEPT_RANGES, "bytes")
+                                .body(body)
+                                .unwrap())
                         } else {
-                            hyper::Body::wrap_stream(stream)
-                        };
-                        Ok(hyper::Response::builder()
-                            .header(hyper::header::CONTENT_LENGTH, file_length)
-                            .body(body)
-                            .unwrap())
+                            let stream = FramedRead::new(file, BytesCodec::new())
+                                .map_ok(|b| b.freeze());
+                            let body = if let Some(timeout) = snapshot_timeout {
+                                hyper::Body::wrap_stream(TimeoutStream::new(stream, timeout))
+                            } else {
+                                hyper::Body::wrap_stream(stream)
+                            };
+                            Ok(hyper::Response::builder()
+                                .header(hyper::header::CONTENT_LENGTH, file_length)
+                                .header(hyper::header::ACCEPT_RANGES, "bytes")
+                                .body(body)
+                                .unwrap())
+                        }
                     }
                 }
             }),
@@ -390,7 +525,8 @@ impl RequestMiddleware for RpcRequestMiddleware {
         if let Some(path) = match_supply_path(request.uri().path()) {
             process_rest(&self.bank_forks, path)
         } else if self.is_file_get_path(request.uri().path()) {
-            self.process_file_get(request.uri().path())
+            let range_header = request.headers().get(hyper::header::RANGE).cloned();
+            self.process_file_get(request.uri().path(), range_header)
         } else if request.uri().path() == "/health" {
             hyper::Response::builder()
                 .status(hyper::StatusCode::OK)
@@ -1127,7 +1263,7 @@ mod tests {
         );
 
         // File does not exist => request should fail.
-        let action = rrm.process_file_get(DEFAULT_GENESIS_DOWNLOAD_PATH);
+        let action = rrm.process_file_get(DEFAULT_GENESIS_DOWNLOAD_PATH, None);
         if let RequestMiddlewareAction::Respond { response, .. } = action {
             let response = runtime.block_on(response);
             let response = response.unwrap();
@@ -1142,7 +1278,7 @@ mod tests {
         }
 
         // Normal file exist => request should succeed.
-        let action = rrm.process_file_get(DEFAULT_GENESIS_DOWNLOAD_PATH);
+        let action = rrm.process_file_get(DEFAULT_GENESIS_DOWNLOAD_PATH, None);
         if let RequestMiddlewareAction::Respond { response, .. } = action {
             let response = runtime.block_on(response);
             let response = response.unwrap();
@@ -1159,11 +1295,205 @@ mod tests {
         symlink::symlink_file("wrong", &genesis_path).unwrap();
 
         // File is a symbolic link => request should fail.
-        let action = rrm.process_file_get(DEFAULT_GENESIS_DOWNLOAD_PATH);
+        let action = rrm.process_file_get(DEFAULT_GENESIS_DOWNLOAD_PATH, None);
         if let RequestMiddlewareAction::Respond { response, .. } = action {
             let response = runtime.block_on(response);
             let response = response.unwrap();
             assert_ne!(response.status(), 200);
+        } else {
+            panic!("Unexpected RequestMiddlewareAction variant");
+        }
+    }
+
+    #[test]
+    fn test_parse_range_header() {
+        use hyper::header::HeaderValue;
+
+        let file_length = 1000u64;
+
+        // Valid range: bytes=0-499
+        let hv = HeaderValue::from_static("bytes=0-499");
+        let r = RpcRequestMiddleware::parse_range_header(&hv, file_length).unwrap();
+        assert_eq!(r, ByteRange { start: 0, end: 499 });
+
+        // Valid range: bytes=500-999
+        let hv = HeaderValue::from_static("bytes=500-999");
+        let r = RpcRequestMiddleware::parse_range_header(&hv, file_length).unwrap();
+        assert_eq!(r, ByteRange { start: 500, end: 999 });
+
+        // Open-ended range: bytes=500-
+        let hv = HeaderValue::from_static("bytes=500-");
+        let r = RpcRequestMiddleware::parse_range_header(&hv, file_length).unwrap();
+        assert_eq!(r, ByteRange { start: 500, end: 999 });
+
+        // Suffix range: bytes=-200 (last 200 bytes)
+        let hv = HeaderValue::from_static("bytes=-200");
+        let r = RpcRequestMiddleware::parse_range_header(&hv, file_length).unwrap();
+        assert_eq!(r, ByteRange { start: 800, end: 999 });
+
+        // Suffix range larger than file: bytes=-2000
+        let hv = HeaderValue::from_static("bytes=-2000");
+        let r = RpcRequestMiddleware::parse_range_header(&hv, file_length).unwrap();
+        assert_eq!(r, ByteRange { start: 0, end: 999 });
+
+        // Clamping: end > file size
+        let hv = HeaderValue::from_static("bytes=0-5000");
+        let r = RpcRequestMiddleware::parse_range_header(&hv, file_length).unwrap();
+        assert_eq!(r, ByteRange { start: 0, end: 999 });
+
+        // Unsatisfiable: start >= file size
+        let hv = HeaderValue::from_static("bytes=1000-");
+        let r = RpcRequestMiddleware::parse_range_header(&hv, file_length);
+        assert_eq!(r, Err(RangeError::NotSatisfiable));
+
+        let hv = HeaderValue::from_static("bytes=1500-2000");
+        let r = RpcRequestMiddleware::parse_range_header(&hv, file_length);
+        assert_eq!(r, Err(RangeError::NotSatisfiable));
+
+        // Suffix zero: bytes=-0
+        let hv = HeaderValue::from_static("bytes=-0");
+        let r = RpcRequestMiddleware::parse_range_header(&hv, file_length);
+        assert_eq!(r, Err(RangeError::NotSatisfiable));
+
+        // Multi-range (comma) => Invalid
+        let hv = HeaderValue::from_static("bytes=0-100,200-300");
+        let r = RpcRequestMiddleware::parse_range_header(&hv, file_length);
+        assert_eq!(r, Err(RangeError::Invalid));
+
+        // Malformed: no "bytes=" prefix
+        let hv = HeaderValue::from_static("0-499");
+        let r = RpcRequestMiddleware::parse_range_header(&hv, file_length);
+        assert_eq!(r, Err(RangeError::Invalid));
+
+        // Malformed: garbage
+        let hv = HeaderValue::from_static("bytes=abc-def");
+        let r = RpcRequestMiddleware::parse_range_header(&hv, file_length);
+        assert_eq!(r, Err(RangeError::Invalid));
+    }
+
+    #[test]
+    fn test_process_file_get_range_request() {
+        use hyper::header::HeaderValue;
+
+        let runtime = Runtime::new().unwrap();
+
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
+        let genesis_path = ledger_path.path().join(DEFAULT_GENESIS_ARCHIVE);
+        let bank_forks = create_bank_forks();
+        let optimistically_confirmed_bank =
+            OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
+        let rrm = RpcRequestMiddleware::new(
+            ledger_path.path().to_path_buf(),
+            None,
+            bank_forks,
+            RpcHealth::stub(optimistically_confirmed_bank, blockstore),
+        );
+
+        let file_content = b"Hello, Range Request World!";
+        {
+            let mut file = std::fs::File::create(&genesis_path).unwrap();
+            file.write_all(file_content).unwrap();
+        }
+
+        // 200 with Accept-Ranges header when no Range header
+        let action = rrm.process_file_get(DEFAULT_GENESIS_DOWNLOAD_PATH, None);
+        if let RequestMiddlewareAction::Respond { response, .. } = action {
+            let response = runtime.block_on(response).unwrap();
+            assert_eq!(response.status(), 200);
+            assert_eq!(
+                response.headers().get("accept-ranges").unwrap(),
+                "bytes"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("content-length")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                file_content.len().to_string()
+            );
+        } else {
+            panic!("Unexpected RequestMiddlewareAction variant");
+        }
+
+        // 206 Partial Content with valid range
+        let range_hv = HeaderValue::from_static("bytes=0-4");
+        let action =
+            rrm.process_file_get(DEFAULT_GENESIS_DOWNLOAD_PATH, Some(range_hv));
+        if let RequestMiddlewareAction::Respond { response, .. } = action {
+            let response = runtime.block_on(response).unwrap();
+            assert_eq!(response.status(), 206);
+            assert_eq!(
+                response.headers().get("content-range").unwrap(),
+                &format!("bytes 0-4/{}", file_content.len())
+            );
+            assert_eq!(
+                response.headers().get("content-length").unwrap(),
+                "5"
+            );
+            assert_eq!(
+                response.headers().get("accept-ranges").unwrap(),
+                "bytes"
+            );
+            // Verify body content
+            let body = runtime.block_on(hyper::body::to_bytes(response.into_body())).unwrap();
+            assert_eq!(&body[..], b"Hello");
+        } else {
+            panic!("Unexpected RequestMiddlewareAction variant");
+        }
+
+        // 206 with open-ended range
+        let range_hv = HeaderValue::from_static("bytes=7-");
+        let action =
+            rrm.process_file_get(DEFAULT_GENESIS_DOWNLOAD_PATH, Some(range_hv));
+        if let RequestMiddlewareAction::Respond { response, .. } = action {
+            let response = runtime.block_on(response).unwrap();
+            assert_eq!(response.status(), 206);
+            let body = runtime.block_on(hyper::body::to_bytes(response.into_body())).unwrap();
+            assert_eq!(&body[..], &file_content[7..]);
+        } else {
+            panic!("Unexpected RequestMiddlewareAction variant");
+        }
+
+        // 416 Range Not Satisfiable for out-of-bounds
+        let range_hv = HeaderValue::from_static("bytes=1000-2000");
+        let action =
+            rrm.process_file_get(DEFAULT_GENESIS_DOWNLOAD_PATH, Some(range_hv));
+        if let RequestMiddlewareAction::Respond { response, .. } = action {
+            let response = runtime.block_on(response).unwrap();
+            assert_eq!(response.status(), 416);
+            assert_eq!(
+                response.headers().get("content-range").unwrap(),
+                &format!("bytes */{}", file_content.len())
+            );
+        } else {
+            panic!("Unexpected RequestMiddlewareAction variant");
+        }
+
+        // Malformed range falls back to 200 full response
+        let range_hv = HeaderValue::from_static("invalid-range");
+        let action =
+            rrm.process_file_get(DEFAULT_GENESIS_DOWNLOAD_PATH, Some(range_hv));
+        if let RequestMiddlewareAction::Respond { response, .. } = action {
+            let response = runtime.block_on(response).unwrap();
+            assert_eq!(response.status(), 200);
+            assert_eq!(
+                response.headers().get("accept-ranges").unwrap(),
+                "bytes"
+            );
+        } else {
+            panic!("Unexpected RequestMiddlewareAction variant");
+        }
+
+        // Multi-range falls back to 200
+        let range_hv = HeaderValue::from_static("bytes=0-4,10-14");
+        let action =
+            rrm.process_file_get(DEFAULT_GENESIS_DOWNLOAD_PATH, Some(range_hv));
+        if let RequestMiddlewareAction::Respond { response, .. } = action {
+            let response = runtime.block_on(response).unwrap();
+            assert_eq!(response.status(), 200);
         } else {
             panic!("Unexpected RequestMiddlewareAction variant");
         }
